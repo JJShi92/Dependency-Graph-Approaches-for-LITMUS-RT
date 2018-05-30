@@ -1,0 +1,336 @@
+diff -Naur liblitmus/bin/rtspin.c liblitmus-dga/bin/rtspin.c
+--- liblitmus/bin/rtspin.c	2016-06-22 11:28:09.000000000 +0200
++++ liblitmus-dga/bin/rtspin.c	2018-05-27 16:22:56.000000000 +0200
+@@ -14,63 +14,31 @@
+ #include "litmus.h"
+ #include "common.h"
+ 
+-const char *usage_msg =
+-	"Usage: (1) rtspin OPTIONS WCET PERIOD DURATION\n"
+-	"       (2) rtspin OPTIONS -F FILE [-C COLUMN] WCET PERIOD\n"
+-	"       (3) rtspin -l\n"
+-	"       (4) rtspin -B\n"
+-	"\n"
+-	"Modes: (1) run as periodic task with given WCET and PERIOD\n"
+-	"       (2) as (1), but load per-job execution times from a CSV file\n"
+-	"       (3) Run calibration loop (how accurately are target runtimes met?)\n"
+-	"       (4) Run background, non-real-time cache-thrashing loop (w/ -m).\n"
+-	"\n"
+-	"Required arguments:\n"
+-	"    WCET, PERIOD      reservation parameters (in ms)\n"
+-	"    DURATION          terminate the task after DURATION seconds\n"
+-	"\n"
+-	"Options:\n"
+-	"    -B                run non-real-time background loop\n"
+-	"    -c be|srt|hrt     task class (best-effort, soft real-time, hard real-time)\n"
+-	"    -d DEADLINE       relative deadline, equal to the period by default (in ms)\n"
+-	"    -e                turn on budget enforcement (off by default)\n"
+-	"    -h                show this help message\n"
+-	"    -i                report interrupts (implies -v)\n"
+-	"    -l                run calibration loop and report error\n"
+-	"    -m FOOTPRINT      specify number of data pages to access\n"
+-	"    -o OFFSET         offset (also known as phase), zero by default (in ms)\n"
+-	"    -p CPU            partition or cluster to assign this task to\n"
+-	"    -q PRIORITY       priority to use (ignored by EDF plugins, highest=1, lowest=511)\n"
+-	"    -r VCPU           virtual CPU or reservation to attach to (irrelevant to most plugins)\n"
+-	"    -R                create sporadic reservation for task (with VCPU=PID)\n"
+-	"    -s SCALE          fraction of WCET to spin for (1.0 means 100%)\n"
+-	"    -u SLACK          randomly under-run WCET by up to SLACK milliseconds\n"
+-	"    -v                verbose (print per-job statistics)\n"
+-	"    -w                wait for synchronous release\n"
+-	"\n"
+-	"    -F FILE           load per-job execution times from CSV file\n"
+-	"    -C COLUMNS        specify column to read per-job execution times from (default: 1)\n"
+-	"\n"
+-	"    -X PROTOCOL       access a shared resource protected by a locking protocol\n"
+-	"    -L CS-LENGTH      simulate a critical section length of CS-LENGTH milliseconds\n"
+-	"    -Q RESOURCE-ID    access the resource identified by RESOURCE-ID\n"
+-	"\n"
+-	"Units:\n"
+-	"    WCET and PERIOD are expected in milliseconds.\n"
+-	"    SLACK is expected in milliseconds.\n"
+-	"    DURATION is expected in seconds.\n"
+-	"    CS-LENGTH is expected in milliseconds.\n"
+-	"    FOOTPRINT is expected in number of pages\n";
+ 
+ 
+ static void usage(char *error) {
+ 	if (error)
+-		fprintf(stderr, "Error: %s\n\n", error);
+-	else {
+-		fprintf(stderr, "rtspin: simulate a periodic CPU-bound "
+-		                "real-time task\n\n");
+-	}
+-	fprintf(stderr, "%s", usage_msg);
++		fprintf(stderr, "Error: %s\n", error);
++	fprintf(stderr,
++		"Usage:\n"
++		"       (1) rtspin [COMMON-OPTS] WCET PERIOD DURATION\n"
++		"       (2) rtspin [COMMON-OPTS] -f FILE [-o COLUMN] WCET PERIOD\n"
++		"       (3) rtspin -l\n"
++		"       (4) rtspin -B\n"
++		"\n"
++		"Modes: (1) run as periodic task with given WCET and PERIOD\n"
++		"       (2) as (1), but load per-job execution times from CSV file\n"
++		"       (3) Run calibration loop (how accurately are target runtimes met?)\n"
++		"       (4) Run background, non-real-time cache-thrashing loop (w/ -m).\n"
++		"\n"
++		"COMMON-OPTS = [-w] [-s SCALE]\n"
++		"              [-p PARTITION/CLUSTER [-z CLUSTER SIZE]] [-c CLASS]\n"
++		"              [-X LOCKING-PROTOCOL] [-L CRITICAL SECTION LENGTH] [-Q RESOURCE-ID]\n"
++		"	       [-m RESIDENT SET SIZE]\n"
++		"\n"
++		"WCET and PERIOD are milliseconds, DURATION is seconds.\n"
++		"CRITICAL SECTION LENGTH is in milliseconds.\n"
++		"RESIDENT SET SIZE is in number of pages\n");
+ 	exit(error ? EXIT_FAILURE : EXIT_SUCCESS);
+ }
+ 
+@@ -225,7 +193,7 @@
+ 	else {
+ 		if (lock_od >= 0) {
+ 			/* simulate critical section somewhere in the middle */
+-			chunk1 = drand48() * (exec_time - cs_length);
++			chunk1 = 0.5 * (exec_time - cs_length);
+ 			chunk2 = exec_time - cs_length - chunk1;
+ 
+ 			/* non-critical section */
+@@ -246,18 +214,21 @@
+ 	}
+ }
+ 
+-#define OPTSTR "p:c:wlveo:F:s:m:q:r:X:L:Q:iRu:Bhd:C:"
++#define OPTSTR "p:c:wlveo:f:s:M:m:q:r:X:L:Q:O:T:viRu:Bh"
+ int main(int argc, char** argv)
+ {
+ 	int ret;
+ 	lt_t wcet;
+-	lt_t period, deadline;
+-	lt_t phase;
++	lt_t period;
+ 	double wcet_ms, period_ms, underrun_ms = 0;
+-	double offset_ms = 0, deadline_ms = 0;
+ 	unsigned int priority = LITMUS_NO_PRIORITY;
+ 	int migrate = 0;
+ 	int cluster = 0;
++
++	int if_migrate = 0;
++	int mig_to_cpu = 0;
++	int sem_target_cpu = 0;
++
+ 	int reservation = -1;
+ 	int create_reservation = 0;
+ 	int opt;
+@@ -290,6 +261,10 @@
+ 	int protocol = -1;
+ 	double cs_length = 1; /* millisecond */
+ 
++	/* O: task's order; T: total tasks */
++	int rt_order = -1;
++	int total_tasks = 0;
++
+ 	progname = argv[0];
+ 
+ 	while ((opt = getopt(argc, argv, OPTSTR)) != -1) {
+@@ -301,6 +276,10 @@
+ 			cluster = atoi(optarg);
+ 			migrate = 1;
+ 			break;
++		case 'M':
++			mig_to_cpu = atoi(optarg);
++			if_migrate = 1;
++			break;
+ 		case 'r':
+ 			reservation = atoi(optarg);
+ 			break;
+@@ -327,10 +306,10 @@
+ 		case 'B':
+ 			background_loop = 1;
+ 			break;
+-		case 'C':
++		case 'o':
+ 			column = atoi(optarg);
+ 			break;
+-		case 'F':
++		case 'f':
+ 			file = optarg;
+ 			break;
+ 		case 'm':
+@@ -339,16 +318,6 @@
+ 		case 's':
+ 			scale = atof(optarg);
+ 			break;
+-		case 'o':
+-			offset_ms = atof(optarg);
+-			break;
+-		case 'd':
+-			deadline_ms = atof(optarg);
+-			if (!deadline_ms || deadline_ms < 0) {
+-				usage("The relative deadline must be a positive"
+-					" number.");
+-			}
+-			break;
+ 		case 'u':
+ 			underrun_ms = atof(optarg);
+ 			if (underrun_ms <= 0)
+@@ -369,6 +338,18 @@
+ 			if (resource_id <= 0 && strcmp(optarg, "0"))
+ 				usage("Invalid resource ID.");
+ 			break;
++		case 'O':
++			rt_order = atoi(optarg);
++			if (rt_order < 0) {
++				usage("Invalid task's order.");
++			}
++			break;
++		case 'T':
++			total_tasks = atoi(optarg);
++			if (total_tasks <= 0) {
++				usage("Invalid total number of tasks.");
++			}
++			break;
+ 		case 'v':
+ 			verbose = 1;
+ 			break;
+@@ -376,7 +357,6 @@
+ 			usage(NULL);
+ 			break;
+ 		case 'i':
+-			verbose = 1;
+ 			report_interrupts = 1;
+ 			break;
+ 		case ':':
+@@ -450,15 +430,9 @@
+ 
+ 	wcet   = ms2ns(wcet_ms);
+ 	period = ms2ns(period_ms);
+-	phase  = ms2ns(offset_ms);
+-	deadline = ms2ns(deadline_ms);
+ 	if (wcet <= 0)
+ 		usage("The worst-case execution time must be a "
+ 				"positive number.");
+-	if (offset_ms < 0)
+-		usage("The synchronous release delay must be a "
+-				"non-negative number.");
+-
+ 	if (period <= 0)
+ 		usage("The period must be a positive number.");
+ 	if (!file && wcet > period) {
+@@ -481,10 +455,10 @@
+ 	init_rt_task_param(&param);
+ 	param.exec_cost = wcet;
+ 	param.period = period;
+-	param.phase  = phase;
+-	param.relative_deadline = deadline;
+ 	param.priority = priority == LITMUS_NO_PRIORITY ? LITMUS_LOWEST_PRIORITY : priority;
+ 	param.cls = class;
++	param.rt_order = rt_order;
++	param.total_tasks = total_tasks;
+ 	param.budget_policy = (want_enforcement) ?
+ 			PRECISE_ENFORCEMENT : NO_ENFORCEMENT;
+ 	if (migrate) {
+@@ -505,8 +479,7 @@
+ 		config.priority = priority;
+ 		config.polling_params.budget = wcet;
+ 		config.polling_params.period = period;
+-		config.polling_params.offset = phase;
+-		config.polling_params.relative_deadline = deadline;
++		config.polling_params.relative_deadline = period;
+ 		ret = reservation_create(SPORADIC_POLLING, &config);
+ 		if (ret < 0)
+ 			bail_out("failed to create reservation");
+@@ -526,7 +499,12 @@
+ 
+ 	if (protocol >= 0) {
+ 		/* open reference to semaphore */
+-		lock_od = litmus_open_lock(protocol, resource_id, lock_namespace, &cluster);
++		if (if_migrate >= 1) {
++			sem_target_cpu = mig_to_cpu;
++		} else {
++			sem_target_cpu = cluster;
++		}
++		lock_od = litmus_open_lock(protocol, resource_id, lock_namespace, &sem_target_cpu);
+ 		if (lock_od < 0) {
+ 			perror("litmus_open_lock");
+ 			usage("Could not open lock.");
+@@ -562,8 +540,7 @@
+ 					current  = monotime();
+ 					printf("\tdeadline: %" PRIu64 "ns (=%.2fs)\n",
+ 					       (uint64_t) cp->deadline, deadline);
+-					printf("\tcurrent time: %.2fs, "
+-					       "time until deadline: %.2fms\n",
++					printf("\tcurrent time: %.2fs, slack: %.2fms\n",
+ 					       current, (deadline - current) * 1000);
+ 				}
+ 				if (report_interrupts && cp) {
+@@ -581,7 +558,7 @@
+ 				acet = 0;
+ 			acet *= scale;
+ 			if (verbose)
+-				printf("\ttarget exec. time: %6.2fms (%.2f%% of WCET)\n",
++				printf("\ttarget ACET: %6.2fms (%.2f%% of WCET)\n",
+ 					acet * 1000,
+ 					(acet * 1000 / wcet_ms) * 100);
+ 		} while (job(acet, start + duration,
+diff -Naur liblitmus/include/litmus.h liblitmus-dga/include/litmus.h
+--- liblitmus/include/litmus.h	2016-06-22 11:28:09.000000000 +0200
++++ liblitmus-dga/include/litmus.h	2018-05-27 16:36:27.000000000 +0200
+@@ -170,6 +170,8 @@
+ 	DPCP_SEM	= 4, /**< Distributed Priority Ceiling Protocol */
+ 	PCP_SEM		= 5, /**< Priority Ceiling Protocol */
+ 	DFLP_SEM	= 6, /**< Distributed FIFO Locking Protocol */
++	SDGA_SEM	= 7, /**< Semi-partitioned Dependency Graph Approach */
++	PDGA_SEM	= 8, /**< Partitioned Dependency Graph Approach */
+ } obj_type_t;
+ 
+ /**
+@@ -405,6 +407,28 @@
+ 	return od_openx(fd, DPCP_SEM, name, &cpu);
+ }
+ 
++/**
++ * Allocate a semaphore following the PDGA protocol
++ * @param fd File descriptor to associate lock with
++ * @param name Name of the lock, user-chosen integer
++ * @return Object descriptor for given lock
++ */
++static inline int open_pdga_sem(int fd, int name)
++{
++        return od_open(fd, PDGA_SEM, name);
++}
++
++/**
++ * Allocate a semaphore following the SDGA protocol
++ * @param fd File descriptor to associate lock with
++ * @param name Name of the lock, user-chosen integer
++ * @param cpu CPU to associate this lock with
++ * @return Object descriptor for given lock
++ */
++static inline int open_sdga_sem(int fd, int name, int cpu)
++{
++        return od_openx(fd, SDGA_SEM, name, &cpu);
++}
+ 
+ /**
+  * Allocate a semaphore following the DFLP protocol
+diff -Naur liblitmus/src/litmus.c liblitmus-dga/src/litmus.c
+--- liblitmus/src/litmus.c	2016-06-22 11:28:09.000000000 +0200
++++ liblitmus-dga/src/litmus.c	2018-05-27 16:37:40.000000000 +0200
+@@ -27,6 +27,8 @@
+ 	LP(DPCP),
+ 	LP(PCP),
+ 	LP(DFLP),
++	LP(SDGA),
++	LP(PDGA),
+ };
+ 
+ #define NUM_PROTOS (sizeof(protocol)/sizeof(protocol[0]))
+@@ -104,6 +106,8 @@
+ 	tp->priority = LITMUS_LOWEST_PRIORITY;
+ 	tp->budget_policy = NO_ENFORCEMENT;
+ 	tp->release_policy = TASK_SPORADIC;
++	tp->rt_order = -1;
++	tp->total_tasks = 0;
+ }
+ 
+ task_class_t str2class(const char* str)
